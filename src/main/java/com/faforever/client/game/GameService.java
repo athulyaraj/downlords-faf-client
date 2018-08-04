@@ -1,6 +1,8 @@
 package com.faforever.client.game;
 
 import com.faforever.client.config.ClientProperties;
+import com.faforever.client.discord.DiscordJoinEvent;
+import com.faforever.client.discord.DiscordRichPresenceService;
 import com.faforever.client.fa.ForgedAllianceService;
 import com.faforever.client.fa.RatingMode;
 import com.faforever.client.fa.relay.event.RehostRequestEvent;
@@ -41,7 +43,8 @@ import javafx.beans.property.BooleanProperty;
 import javafx.beans.property.ReadOnlyBooleanProperty;
 import javafx.beans.property.SimpleBooleanProperty;
 import javafx.beans.property.SimpleObjectProperty;
-import javafx.beans.value.WeakChangeListener;
+import javafx.beans.value.ChangeListener;
+import javafx.beans.value.ObservableValue;
 import javafx.collections.FXCollections;
 import javafx.collections.ListChangeListener;
 import javafx.collections.ObservableList;
@@ -52,6 +55,7 @@ import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.context.annotation.Lazy;
+import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Service;
 
 import javax.annotation.PostConstruct;
@@ -60,6 +64,7 @@ import java.io.IOException;
 import java.lang.invoke.MethodHandles;
 import java.net.URI;
 import java.nio.file.Path;
+import java.text.MessageFormat;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -141,7 +146,7 @@ public class GameService {
                      NotificationService notificationService, I18n i18n, Executor executor,
                      PlayerService playerService, ReportingService reportingService, EventBus eventBus,
                      IceAdapter iceAdapter, ModService modService, PlatformService platformService,
-                     ExternalReplayInfoGenerator externalReplayInfoGenerator) {
+                     ExternalReplayInfoGenerator externalReplayInfoGenerator, DiscordRichPresenceService discordRichPresenceService) {
     this.fafService = fafService;
     this.forgedAllianceService = forgedAllianceService;
     this.mapService = mapService;
@@ -169,11 +174,27 @@ public class GameService {
         return;
       }
 
-      JavaFxUtil.addListener(newValue.statusProperty(), new WeakChangeListener<>((observable1, oldValue1, newValue1) -> {
-        if (newValue1 == GameStatus.CLOSED) {
-          onCurrentGameEnded();
+      final Player currentPlayer = playerService.getCurrentPlayer().orElseThrow(() -> new IllegalStateException("Player must be set"));
+      ChangeListener<Number> numberOfPlayersChangedListener = (numberOfPlayersObservable, oldNumberOfPlayers, newNumberOfPlayers) ->
+          discordRichPresenceService.updatePlayedGameTo(currentGame.get(), currentPlayer.getId());
+
+      JavaFxUtil.addListener(newValue.numPlayersProperty(), numberOfPlayersChangedListener);
+
+      ChangeListener<GameStatus> currentGameStatusListener = new ChangeListener<GameStatus>() {
+        @Override
+        public void changed(ObservableValue<? extends GameStatus> observable1, GameStatus oldStatus, GameStatus newStatus) {
+          discordRichPresenceService.updatePlayedGameTo(currentGame.get(), currentPlayer.getId());
+          if (oldStatus == GameStatus.PLAYING && newStatus == GameStatus.CLOSED) {
+            GameService.this.onCurrentGameEnded();
+          }
+          if (newStatus == GameStatus.CLOSED) {
+            newValue.statusProperty().removeListener(this);
+            newValue.numPlayersProperty().removeListener(numberOfPlayersChangedListener);
+          }
         }
-      }));
+      };
+
+      JavaFxUtil.addListener(newValue.statusProperty(), currentGameStatusListener);
     });
 
     games = FXCollections.observableList(new ArrayList<>(),
@@ -199,11 +220,9 @@ public class GameService {
     JavaFxUtil.attachListToMap(games, uidToGameInfoBean);
   }
 
-
   public ReadOnlyBooleanProperty gameRunningProperty() {
     return gameRunning;
   }
-
 
   public CompletableFuture<Void> hostGame(NewGameInfo newGameInfo) {
     if (isRunning()) {
@@ -218,7 +237,6 @@ public class GameService {
         .thenCompose(aVoid -> fafService.requestHostGame(newGameInfo))
         .thenAccept(gameLaunchMessage -> startGame(gameLaunchMessage, null, RatingMode.GLOBAL));
   }
-
 
   public CompletableFuture<Void> joinGame(Game game, String password) {
     if (isRunning()) {
@@ -269,7 +287,6 @@ public class GameService {
   /**
    * @param path a replay file that is readable by the preferences without any further conversion
    */
-
   public void runWithReplay(Path path, @Nullable Integer replayId, String featuredMod, Integer version, Map<String, Integer> modVersions, Set<String> simMods, String mapName) {
     if (isRunning()) {
       logger.warn("Forged Alliance is already running, not starting replay");
@@ -304,7 +321,6 @@ public class GameService {
     );
   }
 
-
   public CompletableFuture<Void> runWithLiveReplay(URI replayUrl, Integer gameId, String gameType, String mapName) {
     if (isRunning()) {
       logger.warn("Forged Alliance is already running, not starting live replay");
@@ -331,11 +347,9 @@ public class GameService {
     return playerService.getCurrentPlayer().orElseThrow(() -> new IllegalStateException("Player has not been set"));
   }
 
-
   public ObservableList<Game> getGames() {
     return games;
   }
-
 
   public Game getByUid(int uid) {
     Game game = uidToGameInfoBean.get(uid);
@@ -345,11 +359,9 @@ public class GameService {
     return game;
   }
 
-
   public void addOnRankedMatchNotificationListener(Consumer<MatchmakerMessage> listener) {
     fafService.addOnMessageListener(MatchmakerMessage.class, listener);
   }
-
 
   public CompletableFuture<Void> startSearchLadder1v1(Faction faction) {
     if (isRunning()) {
@@ -383,14 +395,12 @@ public class GameService {
         });
   }
 
-
   public void stopSearchLadder1v1() {
     if (searching1v1.get()) {
       fafService.stopSearchingRanked();
       searching1v1.set(false);
     }
   }
-
 
   public BooleanProperty searching1v1Property() {
     return searching1v1;
@@ -400,7 +410,6 @@ public class GameService {
    * Returns the preferences the player is currently in. Returns {@code null} if not in a preferences.
    */
   @Nullable
-
   public Game getCurrentGame() {
     synchronized (currentGame) {
       return currentGame.get();
@@ -414,7 +423,6 @@ public class GameService {
   private CompletableFuture<Void> updateGameIfNecessary(FeaturedMod featuredMod, @Nullable Integer version, @NotNull Map<String, Integer> featuredModVersions, @NotNull Set<String> simModUids) {
     return gameUpdater.update(featuredMod, version, featuredModVersions, simModUids);
   }
-
 
   public boolean isGameRunning() {
     synchronized (gameRunning) {
@@ -628,5 +636,20 @@ public class GameService {
     synchronized (uidToGameInfoBean) {
       uidToGameInfoBean.remove(gameInfoMessage.getUid());
     }
+  }
+
+  @EventListener
+  public void onDiscordGameJoinEvent(DiscordJoinEvent discordJoinEvent) {
+    Integer gameId = discordJoinEvent.getGameId();
+    Game game = getByUid(gameId);
+    boolean disallowJoinsViaDiscord = preferencesService.getPreferences().isDisallowJoinsViaDiscord();
+    if (disallowJoinsViaDiscord) {
+      log.debug("Join was requested via Discord but was rejected due to it being disabled in settings");
+      return;
+    }
+    if (game == null) {
+      throw new IllegalStateException(MessageFormat.format("Could not find game to join, with id: {0}", discordJoinEvent.getGameId()));
+    }
+    joinGame(game, "");
   }
 }
